@@ -1,0 +1,2 @@
+# shell scripts run on the Kindle / in Git Bash: keep LF line endings
+*.sh text eol=lf
