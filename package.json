@@ -1,0 +1,18 @@
+{
+  "name": "kindle-agents-panel",
+  "version": "1.0.0",
+  "description": "T3 Code agents panel for a jailbroken Kindle",
+  "scripts": {
+    "start": "node run.js",
+    "preview": "node run.js --preview"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@napi-rs/canvas": "^0.1.65",
+    "inter-ui": "^4.1.0",
+    "simple-icons": "^13.21.0"
+  }
+}

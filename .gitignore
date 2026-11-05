@@ -1,0 +1,7 @@
+node_modules/
+# runtime state
+panel.log
+panel.pid
+preview.png
+limits-cache.json
+weather-cache.json
