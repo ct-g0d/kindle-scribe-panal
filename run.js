@@ -7,8 +7,8 @@ const path = require("node:path");
 
 const { spawn } = require("node:child_process");
 const { readAgents } = require("./agents");
-const { render, renderOffline, ready } = require("./panel");
-const { readUsage, readWeather, readLimits, readNowPlaying } = require("./extras");
+const { render, renderIcons, kindleLayout, ready } = require("./panel");
+const { readUsage, readWeather, readLimits, readNowPlaying, LAT, LON, TZ } = require("./extras");
 const { readTodos } = require("./warplan");
 
 const HOST = process.env.KINDLE_HOST || "192.168.68.58";
@@ -54,24 +54,50 @@ function upload(buf, dest) {
   });
 }
 
-// Offline watchdog lives on the Kindle (it has to: the PC can't report its own absence).
-// Uploaded once at startup; every push makes sure it's running.
-const WATCHDOG = "/mnt/us/panel-watchdog.sh";
-// "[p]anel" so pgrep doesn't match this very ssh command line, which contains the name too
-const ENSURE_WATCHDOG = `pgrep -f "[p]anel-watchdog" >/dev/null || setsid nohup sh ${WATCHDOG} </dev/null >/dev/null 2>&1 &`;
-async function installWatchdog() {
-  const banner = renderOffline(); // sized and placed to cover the Now Playing box exactly
-  const script = fs.readFileSync(path.join(__dirname, "panel-watchdog.sh"), "utf8")
-    .replace("__X__", banner.x).replace("__Y__", banner.y);
-  const ok = await upload(Buffer.from(script), WATCHDOG) &&
-    await upload(banner.png, "/mnt/us/panel-offline.png");
-  if (ok) await upload(Buffer.alloc(0), "/dev/null; pkill -f '[p]anel-watchdog'; true"); // old copy exits; next push starts the new one
-  console.log(ok ? "watchdog installed on the Kindle" : "watchdog install skipped (Kindle unreachable), will retry on restart");
+// Run a command on the Kindle; resolves its stdout, or null if it failed.
+function remote(cmd) {
+  return new Promise((resolve) => {
+    const p = spawn(SSH, sshArgs(cmd), { env: sshEnv, stdio: ["ignore", "pipe", "ignore"] });
+    let out = "";
+    p.stdout.on("data", (d) => (out += d));
+    p.on("error", () => resolve(null));
+    p.on("close", (code) => resolve(code === 0 ? out : null));
+  });
 }
 
+// The Kindle app (KOReader plugin) is what shows the panel. It draws this PC's frames while they keep coming,
+// and its own clock / weather / battery over the last frame once they stop. Installed (refreshed) at startup.
+const APP = "/mnt/us/kindlepanel"; // fonts, icons, layout, weather cache
+const PLUGIN = "/mnt/us/koreader/plugins/kindlepanel.koplugin";
+const toLua = (v) => typeof v === "object"
+  ? `{ ${Object.entries(v).map(([k, x]) => `${k} = ${toLua(x)}`).join(", ")} }`
+  : typeof v === "string" ? JSON.stringify(v) : String(v);
+async function installApp() {
+  if ((await remote(`mkdir -p ${APP}/fonts ${PLUGIN} /mnt/us/documents && ls ${APP}/fonts`)) == null)
+    return console.log("app install skipped (Kindle unreachable), will retry on restart");
+  const have = new Set((await remote(`ls ${APP}/fonts`) || "").split(/\s+/));
+  const kdir = path.join(__dirname, "kindle");
+  const files = [
+    ...["_meta.lua", "main.lua"].map((f) => [fs.readFileSync(path.join(kdir, "kindlepanel.koplugin", f)), `${PLUGIN}/${f}`]),
+    // fonts are big and never change: only the missing ones
+    ...fs.readdirSync(path.join(kdir, "fonts")).filter((f) => !have.has(f))
+      .map((f) => [fs.readFileSync(path.join(kdir, "fonts", f)), `${APP}/fonts/${f}`]),
+    ...renderIcons().map(({ kind, png }) => [png, `${APP}/wx-${kind}.png`]),
+    [Buffer.from(`-- written by run.js on the PC\nreturn ${toLua({ ...kindleLayout(), lat: LAT, lon: LON, tz: TZ })}\n`), `${APP}/layout.lua`],
+    [Buffer.from("Tap to open the Kindle Panel. Long-press the panel to close it.\n"), "/mnt/us/documents/Kindle Panel.kpanel"],
+  ];
+  let ok = true;
+  for (const [buf, dest] of files) ok = (await upload(buf, `'${dest}'`)) && ok;
+  // the old shell watchdog is replaced by the app
+  await remote("pkill -f '[p]anel-watchdog'; rm -f /mnt/us/panel-watchdog.sh /mnt/us/panel-offline.png; true");
+  console.log(ok ? "Kindle app installed (restart KOReader once to load a new version)" : "Kindle app install incomplete, will retry on restart");
+}
+
+// Written to a temp name first so the Kindle app never reads half a file.
 function push(png, full) {
   // after drawing, report the battery (shown on the next frame)
-  const cmd = `cat > /tmp/agents.png && eips ${full ? "-f -w gc16" : "-w gl16"} -g /tmp/agents.png >/dev/null && { ${ENSURE_WATCHDOG} } && ${BATTERY_CMD}`;
+  const cmd = `cat > /tmp/agents.png.new && mv /tmp/agents.png.new /tmp/agents.png && ` +
+    `eips ${full ? "-f -w gc16" : "-w gl16"} -g /tmp/agents.png >/dev/null && ${BATTERY_CMD}`;
   return new Promise((resolve, reject) => {
     const p = spawn(SSH, sshArgs(cmd), { env: sshEnv, stdio: ["pipe", "pipe", "pipe"] });
     let err = "", out = "";
@@ -108,11 +134,18 @@ async function gather() {
   };
 }
 
+// The frame the Kindle falls back to when the PC goes away; refreshed every BASE_EVERY pushes.
+const BASE_EVERY = 5;
+let lastPushAt = 0;
 async function tick() {
   const data = await gather();
   const png = render(data);
-  const full = pushes % FULL_EVERY === 0;
+  // full refresh on the usual cycle, and when coming back after a gap (the Kindle drew its own screen meanwhile)
+  const full = pushes % FULL_EVERY === 0 || Date.now() - lastPushAt > 5 * 60e3;
   await push(png, full);
+  lastPushAt = Date.now();
+  if (pushes % BASE_EVERY === 0)
+    await upload(render(data, { standalone: true }), "/tmp/panel-base.png.new && mv /tmp/panel-base.png.new /tmp/panel-base.png");
   pushes++;
   const n = (s) => data.agents.filter((a) => a.status === s).length;
   console.log(`${new Date().toLocaleTimeString()}  pushed${full ? " (full refresh)" : ""}  working ${n("working")}  needs-you ${n("needs_you")}  ` +
@@ -123,12 +156,14 @@ async function tick() {
 async function main() {
   const args = process.argv.slice(2);
   if (args.includes("--preview")) {
-    fs.writeFileSync(path.join(__dirname, "preview.png"), render(await gather()));
-    return console.log("wrote preview.png");
+    const data = await gather();
+    fs.writeFileSync(path.join(__dirname, "preview.png"), render(data));
+    fs.writeFileSync(path.join(__dirname, "preview-offline.png"), render(data, { standalone: true }));
+    return console.log("wrote preview.png, preview-offline.png");
   }
   fs.writeFileSync(path.join(__dirname, "panel.pid"), String(process.pid)); // lets stop-panel.ps1 find this loop
   await ready;
-  await installWatchdog();
+  await installApp();
   await readBattery();
   if (args.includes("--once")) return tick();
 
