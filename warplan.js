@@ -6,7 +6,17 @@ const path = require("node:path");
 const vm = require("node:vm");
 
 const APP_HTML = process.env.WARPLAN_HTML || "D:/Nexus/Nexus_Standalone_Apps/WarPlan/resources/app/dist/index.html";
-// War Plan's save file. When War Plan is started from inside the Claude app (a packaged app), Windows redirects
+// War Plan keeps its state in SQLite now (kv table, same keys as the old JSON); the JSON is only a backup copy.
+const STATE_DB = process.env.WARPLAN_DB || "D:/CT_Study/warplan.db";
+const STATE_KEY = "charles-war-plan-v1";
+function readStateDb() {
+  if (!fs.existsSync(STATE_DB)) return null;
+  const { DatabaseSync } = require("node:sqlite");
+  const db = new DatabaseSync(STATE_DB, { readOnly: true });
+  try { return db.prepare("select value from kv where key = ?").get(STATE_KEY)?.value ?? null; }
+  finally { db.close(); }
+}
+// Older War Plan versions: the save file. When War Plan is started from inside the Claude app (a packaged app), Windows redirects
 // its AppData into Claude's package storage, so the real file may live there instead. Use whichever copy is newest.
 const STATE_REL = path.join("warplan", "war-plan.json");
 function statePath() {
@@ -50,7 +60,8 @@ function localKey(d = new Date()) {
 function readTodos(date = new Date()) {
   const key = localKey(date);
   const api = loadPlanCode();
-  const state = JSON.parse(JSON.parse(fs.readFileSync(statePath(), "utf8"))["charles-war-plan-v1"]);
+  const raw = readStateDb() ?? JSON.parse(fs.readFileSync(statePath(), "utf8"))[STATE_KEY];
+  const state = JSON.parse(raw);
   const checks = state.checks?.[key] || {};
   const tasks = api.getActiveTaskIds(key).map((id) => {
     const v = api.getTaskView(id, key);
