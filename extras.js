@@ -176,7 +176,7 @@ function readNowPlaying() {
   });
 }
 
-module.exports = { readUsage, readWeather, readLimits, readNowPlaying, TZ };
+module.exports = { readUsage, readWeather, readLimits, readNowPlaying, TZ, LAT, LON };
 
 if (require.main === module) {
   console.dir(readUsage(), { depth: 3 });

@@ -279,11 +279,17 @@ function topLayout(ctx) {
   return topCols;
 }
 
-function drawTop(ctx, y, h, now, { weather, battery: bat, playing } = {}) {
+function drawTop(ctx, y, h, now, { weather, battery: bat, playing } = {}, standalone = false) {
   const t = new Date(now);
-  const { sep1, ix, blockW, sep2, mx, mw } = topLayout(ctx);
-  text(ctx, t.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" }), M - 8, y + h - 10, 210, "Inter Semi");
+  const { sep1, ix, blockW, sep2, mx, mw, boxY, boxH } = topLayout(ctx);
   const sep = (sx) => { ctx.fillStyle = SEP; ctx.fillRect(sx, y + 18, 3, h - 30); };
+  if (standalone) { // the Kindle draws time, date and battery itself; Now Playing becomes the offline banner
+    sep(sep1); sep(sep2);
+    rrect(ctx, mx, boxY, mw, boxH, 28, INK);
+    text(ctx, "PC offline", mx + mw / 2, boxY + boxH / 2 + 4, 66, "Inter Bold", PAPER, "center");
+    return;
+  }
+  text(ctx, t.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" }), M - 8, y + h - 10, 210, "Inter Semi");
 
   // info block right next to the time
   sep(sep1);
@@ -661,7 +667,9 @@ function agentsWidget(ctx, x, y, w, h, agents, now) {
 }
 
 // ---------- layout ----------
-function render({ agents = [], usage = null, weather = null, todos = null, limits = null, battery = null, playing = null, now = Date.now() } = {}) {
+// standalone: the frame the Kindle shows when the PC goes away. Last PC data, but the clock strip and the
+// weather card are left empty for the Kindle to fill in live (see kindle/kindlepanel.koplugin).
+function render({ agents = [], usage = null, weather = null, todos = null, limits = null, battery = null, playing = null, now = Date.now() } = {}, { standalone = false } = {}) {
   const c = createCanvas(W, H);
   const ctx = c.getContext("2d");
   ctx.fillStyle = PAPER; ctx.fillRect(0, 0, W, H);
@@ -671,7 +679,7 @@ function render({ agents = [], usage = null, weather = null, todos = null, limit
   let y = TOP_Y;
   // clock + Usage on top, T3 Code, Limits · To-Do, Weather at the bottom
   const topH = TOP_H;
-  drawTop(ctx, y, topH, now, { weather, battery, playing }); y += topH + GAP;
+  drawTop(ctx, y, topH, now, { weather, battery, playing }, standalone); y += topH + GAP;
   const usageH = 470;
   usageWidget(ctx, M, y, full, usageH, usage); y += usageH + GAP;
 
@@ -684,7 +692,8 @@ function render({ agents = [], usage = null, weather = null, todos = null, limit
   limitsWidget(ctx, M, y, limW, rowH, limits, now);
   agentsWidget(ctx, M + limW + GAP, y, full - limW - GAP, rowH, agents, now);
 
-  weatherCard(ctx, M, weatherY, full, weatherH, weather);
+  if (standalone) rrect(ctx, M, weatherY, full, weatherH, R, KINDLE_CARD); // the Kindle fills it in
+  else weatherCard(ctx, M, weatherY, full, weatherH, weather);
 
   return grayPng(ctx.getImageData(0, 0, W, H).data, W, H);
 }
@@ -718,16 +727,27 @@ function grayPng(rgba, w, h) {
 // resolves once all icons above have decoded
 const ready = Promise.all(iconLoads);
 
-// Banner the Kindle-side watchdog draws when the PC stops sending: exactly the Now Playing box.
-// Returns the image plus where to draw it (x, y in screen pixels).
-function renderOffline() {
-  const { mx: x, boxY: y, mw: w, boxH: h } = topLayout(createCanvas(10, 10).getContext("2d"));
-  const c = createCanvas(w, h), ctx = c.getContext("2d");
-  ctx.fillStyle = PAPER; ctx.fillRect(0, 0, w, h);
-  rrect(ctx, 0, 0, w, h, 28, INK);
-  text(ctx, "PC offline", w / 2, h / 2 + 4, 66, "Inter Bold", PAPER, "center");
-  text(ctx, "since the time shown", w / 2, h / 2 + 52, 34, "Inter Semi", PAPER, "center");
-  return { png: grayPng(ctx.getImageData(0, 0, w, h).data, w, h), x: Math.round(x), y: Math.round(y) };
+// Weather icons for the Kindle's own weather card, one 160x160 PNG per kind, on the grey the Kindle
+// clears that card to (fbink's GRAYE, a shade off CARD) so they don't show as boxes.
+const ICON_BOX = 160, KINDLE_CARD = "#eeeeee";
+function renderIcons() {
+  const codes = { sun: 0, partly: 2, cloud: 3, fog: 45, rain: 61, snow: 71, storm: 95 };
+  return Object.entries(codes).map(([kind, code]) => {
+    const c = createCanvas(ICON_BOX, ICON_BOX), ctx = c.getContext("2d");
+    ctx.fillStyle = KINDLE_CARD; ctx.fillRect(0, 0, ICON_BOX, ICON_BOX);
+    weatherIcon(ctx, code, ICON_BOX / 2, ICON_BOX / 2, 62, KINDLE_CARD);
+    return { kind, png: grayPng(ctx.getImageData(0, 0, ICON_BOX, ICON_BOX).data, ICON_BOX, ICON_BOX) };
+  });
 }
 
-module.exports = { render, renderOffline, ready };
+// Where the Kindle draws its live parts, so they line up with the PC's frame. Written to the Kindle as a Lua table.
+function kindleLayout() {
+  const { sep1, ix, blockW, sep2, mx, mw, boxY, boxH } = topLayout(createCanvas(10, 10).getContext("2d"));
+  const weatherH = 500;
+  return {
+    W, H, M, P, topY: TOP_Y, topH: TOP_H, sep1, ix, blockW: Math.round(blockW), sep2, mx, mw, boxY, boxH,
+    wx: { x: M, y: H - M - weatherH, w: W - 2 * M, h: weatherH, nowW: 520 }, icon: ICON_BOX, city: CITY,
+  };
+}
+
+module.exports = { render, renderIcons, kindleLayout, ready };
