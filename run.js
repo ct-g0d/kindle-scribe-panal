@@ -84,7 +84,7 @@ async function installApp() {
       .map((f) => [fs.readFileSync(path.join(kdir, "fonts", f)), `${APP}/fonts/${f}`]),
     ...renderIcons().map(({ kind, png }) => [png, `${APP}/wx-${kind}.png`]),
     [Buffer.from(`-- written by run.js on the PC\nreturn ${toLua({ ...kindleLayout(), lat: LAT, lon: LON, tz: TZ })}\n`), `${APP}/layout.lua`],
-    [Buffer.from("Tap to open the Kindle Panel. Long-press the panel to close it.\n"), "/mnt/us/documents/Kindle Panel.kpanel"],
+    [Buffer.from("Tap to open the Kindle Panel. Long-press or swipe the panel to close it.\n"), "/mnt/us/documents/Kindle Panel.kpanel"],
   ];
   let ok = true;
   for (const [buf, dest] of files) ok = (await upload(buf, `'${dest}'`)) && ok;
@@ -95,9 +95,13 @@ async function installApp() {
 
 // Written to a temp name first so the Kindle app never reads half a file.
 function push(png, full) {
-  // after drawing, report the battery (shown on the next frame)
+  // Only draw while the panel is open (KOReader running, app's flag set) and the Kindle is awake; otherwise it
+  // paints over the normal UI or the sleep screen. The file is still updated so the app shows it when opened/woken.
+  // After that, report the battery (next frame).
   const cmd = `cat > /tmp/agents.png.new && mv /tmp/agents.png.new /tmp/agents.png && ` +
-    `eips ${full ? "-f -w gc16" : "-w gl16"} -g /tmp/agents.png >/dev/null && ${BATTERY_CMD}`;
+    `{ ! [ -e /tmp/kindlepanel.open ] || ! ps | grep -q '[r]eader.lua' || ` +
+    `[ "$(lipc-get-prop com.lab126.powerd state)" != active ] || ` +
+    `eips ${full ? "-f -w gc16" : "-w gl16"} -g /tmp/agents.png >/dev/null; } && ${BATTERY_CMD}`;
   return new Promise((resolve, reject) => {
     const p = spawn(SSH, sshArgs(cmd), { env: sshEnv, stdio: ["pipe", "pipe", "pipe"] });
     let err = "", out = "";

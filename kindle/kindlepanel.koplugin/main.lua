@@ -7,8 +7,8 @@ the last PC frame (sent as /tmp/panel-base.png, with the clock strip and weather
 plus a live clock, date and battery, and weather it fetches itself from Open-Meteo.
 
 Drawing goes straight to the framebuffer with fbink/eips (same as the PC push), so KOReader only
-paints a blank white screen underneath. Tap: redraw. Long-press: close.
-Keeps the Kindle awake while open (powerd preventScreenSaver, like the Keep alive plugin).
+paints a blank white screen underneath. Tap: redraw. Long-press or swipe: close.
+Keeps the Kindle awake while open by resetting powerd's idle timer every minute; the power button still sleeps it.
 --]]--
 
 local Blitbuffer = require("ffi/blitbuffer")
@@ -27,6 +27,7 @@ local _ = require("gettext")
 local DIR = "/mnt/us/kindlepanel"
 local PC_IMG = "/tmp/agents.png"       -- latest PC frame
 local BASE_IMG = "/tmp/panel-base.png" -- last PC data, live parts left empty
+local OPEN_FLAG = "/tmp/kindlepanel.open" -- exists while the panel is on screen (run.js checks it)
 
 local FBINK = "/mnt/us/koreader/fbink"
 local STALE = 300                      -- seconds without a PC push before the Kindle takes over
@@ -201,6 +202,7 @@ function PanelScreen:init()
     self.ges_events = {
         Tap = { GestureRange:new { ges = "tap", range = self.dimen } },
         Hold = { GestureRange:new { ges = "hold", range = self.dimen } },
+        Swipe = { GestureRange:new { ges = "swipe", range = self.dimen } },
     }
 end
 
@@ -209,10 +211,23 @@ function PanelScreen:paintTo(bb, x, y)
 end
 
 function PanelScreen:onTap() self.plugin:redraw() return true end
-function PanelScreen:onHold() self.plugin:close() return true end
+-- close must always work, even if something in the plugin is broken. Long-press or a swipe (any direction) closes.
+function PanelScreen:onSwipe() return self:onHold() end
+function PanelScreen:onHold()
+    local ok, err = pcall(self.plugin.close, self.plugin)
+    if not ok then
+        logger.warn("KindlePanel: close failed:", err)
+        os.remove(OPEN_FLAG)
+        UIManager:close(self, "full")
+        self.plugin.screen = nil
+    end
+    return true
+end
 function PanelScreen:onClose() self.plugin:close() return true end
 
 -- ---------- plugin ----------
+local stale_flag_cleared = false -- per KOReader process, shared by the FileManager and Reader instances
+
 local KindlePanel = WidgetContainer:extend {
     name = "kindlepanel",
     is_doc_only = false,
@@ -233,6 +248,15 @@ function KindlePanel:init()
     end
     self.ui.menu:registerToMainMenu(self)
     self.tick = function() self:onTick() end
+    -- Older versions set powerd's preventScreenSaver, which outlives KOReader and blocks the power button.
+    -- Clear it once per KOReader start (unless the Keep alive plugin owns it).
+    if not stale_flag_cleared then
+        stale_flag_cleared = true
+        if not PluginShare.keepalive then sh("lipc-set-prop com.lab126.powerd preventScreenSaver 0") end
+        os.remove(OPEN_FLAG) -- left over if KOReader quit with the panel open
+        -- the PC can only reach the Kindle through this server, so bring it up with KOReader
+        if not G_reader_settings:isTrue("SSH_autostart") then G_reader_settings:saveSetting("SSH_autostart", true) end
+    end
 end
 
 function KindlePanel:isFileTypeSupported(file) return file:lower():match("%.kpanel$") ~= nil end
@@ -246,16 +270,14 @@ function KindlePanel:open()
     if self.screen then return end
     self.screen = PanelScreen:new { plugin = self }
     UIManager:show(self.screen, "full")
-    sh("lipc-set-prop com.lab126.powerd preventScreenSaver 1")
-    PluginShare.keepalive = true -- tells AutoSuspend to leave powerd's timer alone
+    sh("touch " .. OPEN_FLAG) -- the PC only draws while this exists
     self:redraw(1) -- after KOReader has painted the blank screen
 end
 
 function KindlePanel:close()
     if not self.screen then return end
     UIManager:unschedule(self.tick)
-    sh("lipc-set-prop com.lab126.powerd preventScreenSaver 0")
-    PluginShare.keepalive = false
+    os.remove(OPEN_FLAG)
     UIManager:close(self.screen, "full")
     self.screen = nil
 end
@@ -266,10 +288,42 @@ function KindlePanel:redraw(delay)
     UIManager:scheduleIn(delay or 0.2, self.tick)
 end
 
+-- going to sleep: stop the minute tick so it doesn't draw over the sleep screen; onResume restarts it
+function KindlePanel:onSuspend() UIManager:unschedule(self.tick) end
 function KindlePanel:onResume() if self.screen then self:redraw(1) end end
+
+-- The PC reaches the Kindle over KOReader's SSH server and retries every minute on its own, so keeping that
+-- server up is all it takes to reconnect. If it has stopped (KOReader restart, crash), start it again.
+local SSH_PID = "/tmp/dropbear_koreader.pid" -- the SSH plugin's isRunning() only checks this file exists
+function KindlePanel:ensureSSH()
+    local ssh = self.ui and self.ui.SSH
+    if not (ssh and ssh.isRunning and ssh.start) then return end
+    if ssh:isRunning() then
+        local f = io.open(SSH_PID)
+        local pid = f and f:read("*n")
+        if f then f:close() end
+        if pid and lfs.attributes("/proc/" .. pid, "mode") then return end
+        os.remove(SSH_PID) -- dropbear died but left its pid file: clear it so start() really starts it
+    end
+    logger.warn("KindlePanel: SSH server is down, starting it so the PC can reconnect")
+    ssh:start()
+    self.mode = nil -- a start message may cover the panel: redraw everything this tick
+end
 
 function KindlePanel:onTick()
     if not self.screen then return end
+    -- One failed step must never stop the minute loop, or the panel freezes until KOReader restarts.
+    local ok, err = pcall(self.tickBody, self)
+    if not ok then logger.warn("KindlePanel: tick failed:", err) end
+    -- wake just after the next minute starts
+    UIManager:scheduleIn(61 - tonumber(os.date("%S")), self.tick)
+end
+
+function KindlePanel:tickBody()
+    -- Stay awake while left alone: restart powerd's 10-min idle timer each minute, as if the screen was touched.
+    -- Unlike preventScreenSaver, this leaves the power button working, so pressing it still sleeps.
+    Device:getPowerDevice():resetT1Timeout()
+    pcall(self.ensureSSH, self)
     local now = os.time()
     local pc = mtime(PC_IMG)
     if pc and now - pc <= STALE then
@@ -299,8 +353,6 @@ function KindlePanel:onTick()
         self.minutes = (self.minutes or 0) + 1
         drawClock(self.minutes % FLASH_EVERY == 0)
     end
-    -- wake just after the next minute starts
-    UIManager:scheduleIn(61 - tonumber(os.date("%S")), self.tick)
 end
 
 return KindlePanel

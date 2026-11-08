@@ -18,10 +18,11 @@ What it shows:
 
 The PC panel needs nothing on the Kindle. To keep it going when the PC is away (and keep the Kindle awake),
 open the KOReader plugin (`kindle/kindlepanel.koplugin`); without it a PC outage just leaves the last frame. Open it by tapping
-**Kindle Panel.kpanel** in `documents` (or Tools > Kindle Panel). Tap the panel to redraw it, long-press to close it.
-While it's open the Kindle doesn't sleep (it sets powerd's `preventScreenSaver`, like the Keep alive plugin).
+**Kindle Panel.kpanel** in `documents` (or Tools > Kindle Panel). Tap the panel to redraw it, long-press or swipe to close it.
+While it's open the Kindle doesn't sleep on its own (it resets powerd's idle timer every minute), but the power
+button still puts it to sleep; the PC skips drawing while it's asleep.
 
-- **PC sending**: the PC draws its frame every minute, app open or not (as before).
+- **PC sending**: the PC sends its frame every minute, but only draws it while the app is open and the Kindle is awake.
 - **PC quiet for 5 minutes**: the Kindle takes over. It shows the last PC data (a frame the PC sends every 5 pushes
   with the clock strip and weather card left empty, a "PC offline · Last data HH:MM" banner) and draws itself:
   a live clock, date and battery every minute, and weather it fetches from Open-Meteo every 30 minutes.
