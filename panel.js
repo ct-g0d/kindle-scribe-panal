@@ -23,8 +23,14 @@ reg("web/Inter-Medium.woff2", "Inter Medium");
 reg("web/Inter-SemiBold.woff2", "Inter Semi");
 reg("web/Inter-Bold.woff2", "Inter Bold");
 reg("web/Inter-Light.woff2", "Inter Light");
-GlobalFonts.registerFromPath("C:/Windows/Fonts/msyh.ttc", "CJK"); // fallback for Chinese text
-const font = (size, face = "Inter") => `${size}px "${face}", "CJK"`;
+// Chinese (song titles, to-dos, thread titles): Inter has none, so it falls back to LXGW WenKai (a kaiti, OFL,
+// assets/fonts): Regular under the lighter Inter faces, Medium (its heaviest) under SemiBold and Bold.
+// Microsoft YaHei catches any rare character WenKai lacks.
+for (const w of ["Regular", "Medium"])
+  GlobalFonts.registerFromPath(path.join(__dirname, "assets", "fonts", `LXGWWenKai-${w}.ttf`), `CJK ${w}`);
+GlobalFonts.registerFromPath("C:/Windows/Fonts/msyh.ttc", "CJK Last");
+const CJK = { "Inter Semi": "CJK Medium", "Inter Bold": "CJK Medium" };
+const font = (size, face = "Inter") => `${size}px "${face}", "${CJK[face] || "CJK Regular"}", "CJK Last"`;
 
 // ---------- palette (grayscale e-ink) ----------
 // E-ink washes out mid-greys, so text is black unless it's genuinely skippable (LABEL3).
@@ -133,6 +139,10 @@ const glyphs = {
   rings(ctx, cx, cy, s) { ctx.beginPath(); ctx.arc(cx, cy, s * 0.85, 0, 2 * Math.PI); ctx.stroke(); ctx.beginPath(); ctx.arc(cx, cy, s * 0.35, 0, 2 * Math.PI); ctx.stroke(); },
   chart(ctx, cx, cy, s) { [[-0.8, 0.2], [-0.15, -0.5], [0.5, -0.1]].forEach(([dx, top]) => rrect(ctx, cx + dx * s - 4, cy + top * s, 10, s * (1 - top), 5, LABEL2)); },
   grid(ctx, cx, cy, s) { for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) rrect(ctx, cx - s + i * s * 0.72, cy - s + j * s * 0.72, s * 0.5, s * 0.5, 3, LABEL2); },
+  bars(ctx, cx, cy, s) { // bar chart: three rising bars on a baseline
+    const bw = s * 0.5, base = cy + s * 1.05;
+    [0.8, 1.35, 1.9].forEach((bh, i) => rrect(ctx, cx - s * 0.95 + i * s * 0.72, base - bh * s, bw, bh * s, bw / 3, LABEL2));
+  },
   dollar(ctx, cx, cy, s) { ctx.beginPath(); ctx.arc(cx, cy, s * 0.9, 0, 2 * Math.PI); ctx.stroke(); text(ctx, "$", cx, cy + s * 0.45, s * 1.3, "Inter Bold", LABEL2, "center"); },
   check(ctx, cx, cy, s) { rrect(ctx, cx - s, cy - s, 2 * s, 2 * s, s * 0.5, LABEL2); ctx.strokeStyle = CARD; ctx.lineWidth = 4; ctx.beginPath(); ctx.moveTo(cx - s * 0.45, cy); ctx.lineTo(cx - s * 0.1, cy + s * 0.4); ctx.lineTo(cx + s * 0.5, cy - s * 0.35); ctx.stroke(); },
 };
@@ -207,20 +217,19 @@ function statusIcon(ctx, status, cx, cy, r) {
 
 // ---------- sections ----------
 // Clock on the left, weather card (now + 5 days) filling the rest of the top row.
-// Rain from Open-Meteo's 15-minute data (6 h back, 3 h ahead): "Raining since 09:45", "Rain at 11:45", "No rain for 3h".
-const hhmm = (ms) => new Date(ms).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", timeZone: "Pacific/Auckland" });
+// Rain line under the date: "Raining now" / "Rain till 14:30", "Rain at 11:45", "No rain for 3h". What the airport
+// sees right now (weather.raining) beats the model; the model says when it starts or stops.
+const hhmm = (ms) => new Date(ms).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
 function rainLine(weather, now) {
-  const all = weather?.rain15 || [];
-  const cur = all.findIndex((s) => s.at <= now && now < s.at + 15 * 60e3);
-  if (cur < 0 || all.length - cur < 4) return null; // forecast too stale to say anything
+  const slots = (weather?.rain15 || []).filter((s) => s.at + 15 * 60e3 > now).slice(0, 12); // next 3 h
+  if (slots.length < 4) return null; // forecast too stale to say anything
   const wet = (s) => s.mm >= 0.1;
-  if (wet(all[cur])) { // walk back to where this rain started
-    let start = cur;
-    while (start > 0 && wet(all[start - 1])) start--;
-    return { text: start === 0 ? "Raining for 6h+" : `Raining since ${hhmm(all[start].at)}`, soon: true };
+  const raining = weather.raining ?? wet(slots[0]);
+  if (raining) {
+    const stop = wet(slots[0]) && slots.find((s) => !wet(s));
+    return { text: stop ? `Rain till ${hhmm(stop.at)}` : "Raining now", soon: true };
   }
-  const slots = all.slice(cur);
-  const next = slots.find(wet);
+  const next = slots.slice(1).find(wet);
   return next ? { text: `Rain at ${hhmm(next.at)}`, soon: true } : { text: "No rain for 3h", soon: false };
 }
 
@@ -324,45 +333,91 @@ function drawTop(ctx, y, h, now, { weather, battery: bat, playing } = {}, standa
   if (playing.artist) text(ctx, fit(ctx, playing.artist, 40, "Inter Semi", mw), mx, y + h - 24, 40, "Inter Semi", INK);
 }
 
-// Hierarchy: current temperature first, then each day's high, then low / rain.
-function weatherCard(ctx, x, y, w, h, weather) { // now on the left, five days across
+// Hierarchy, left to right: now (biggest: temperature, then what it's like, then feels / high / low),
+// how the next 12 hours go, then the next 3 days. Sized to read from across the room.
+function weatherCard(ctx, x, y, w, h, weather, now = Date.now()) {
   widget(ctx, x, y, w, h);
-  if (!weather) { text(ctx, "Weather unavailable", x + w / 2, y + h / 2 + 14, 40, "Inter Semi", LABEL3, "center"); return; }
+  if (!weather) { text(ctx, "Weather unavailable", x + w / 2, y + h / 2 + 14, 44, "Inter Semi", LABEL3, "center"); return; }
   const n = weather.now, today = weather.days[0];
 
-  const nowW = 520;
-  ctx.fillStyle = INK; glyphs.location(ctx, x + P + 14, y + P + 18, 14);
-  text(ctx, CITY, x + P + 42, y + P + 32, 36, "Inter Semi", INK);
-  const tw = text(ctx, `${Math.round(n.temp)}°`, x + P - 10, y + P + 236, 200, "Inter Light");
-  weatherIcon(ctx, n.code, Math.min(x + P + tw + 70, x + P + nowW - 70), y + P + 130, 62);
-  text(ctx, WMO(n.code)[1], x + P, y + h - P - 56, 46, "Inter Semi", INK);
-  text(ctx, `H ${Math.round(today?.max ?? n.temp)}°   L ${Math.round(today?.min ?? n.temp)}°`, x + P, y + h - P, 38, "Inter Semi", INK);
+  // now
+  const nowW = 540, nx = x + P;
+  ctx.fillStyle = INK; glyphs.location(ctx, nx + 14, y + P + 20, 15);
+  const name = weather.place?.name || CITY;
+  const cw = text(ctx, fit(ctx, name, 42, "Inter Semi", nowW - 60), nx + 44, y + P + 36, 42, "Inter Semi", INK);
+  // when "now" is a real measurement, say from when
+  if (weather.observed) text(ctx, fit(ctx, `· measured ${hhmm(weather.observed.at)}`, 30, "Inter Medium", nowW - 60 - cw - 12),
+    nx + 44 + cw + 12, y + P + 34, 30, "Inter Medium", LABEL3);
+  const tw = text(ctx, `${Math.round(n.temp)}°`, nx - 10, y + P + 236, 200, "Inter Light");
+  weatherIcon(ctx, n.code, Math.min(nx + tw + 76, nx + nowW - 76), y + P + 140, 68);
+  text(ctx, fit(ctx, WMO(n.code)[1], 54, "Inter Bold", nowW), nx, y + h - P - 62, 54, "Inter Bold", INK);
+  const fw = text(ctx, `Feels ${Math.round(n.feels ?? n.temp)}°`, nx, y + h - P, 42, "Inter Semi", INK);
+  text(ctx, `H ${Math.round(today?.max ?? n.temp)}°  L ${Math.round(today?.min ?? n.temp)}°`, nx + fw + 36, y + h - P, 42, "Inter Semi", LABEL3);
 
-  const dx = x + P + nowW, dw = x + w - P - dx;
-  const days = weather.days.slice(0, 5), colW = dw / days.length;
+  // now runs straight on into the next 12 hours (one block, no divider) | next 3 days
+  const days = weather.days.slice(1, 4), colW = 180, daysW = colW * days.length, gap = 48;
+  const dx = x + w - P - daysW, chartX = nx + nowW + 16, chartW = dx - gap - chartX;
+  ctx.fillStyle = SEP; ctx.fillRect(dx - gap / 2, y + P, 2, h - 2 * P);
+  hourlyChart(ctx, chartX, y + P, chartW, h - 2 * P, weather.hourly, now);
   days.forEach((d, i) => {
     const cx = dx + colW * i + colW / 2;
-    ctx.fillStyle = SEP; ctx.fillRect(dx + colW * i, y + P, 2, h - 2 * P);
-    text(ctx, i === 0 ? "Today" : dayName(d.date, "short"), cx, y + P + 40, 40, i === 0 ? "Inter Bold" : "Inter Semi", INK, "center");
-    weatherIcon(ctx, d.code, cx, y + P + 150, 62);
+    text(ctx, dayName(d.date, "short"), cx, y + P + 40, 44, "Inter Semi", INK, "center");
+    weatherIcon(ctx, d.code, cx, y + P + 160, 60);
     const hi = `${Math.round(d.max)}°`, lo = `${Math.round(d.min)}°`;
-    const hw = measure(ctx, hi, 72, "Inter Semi"), lw = measure(ctx, lo, 40, "Inter Medium"), sx = cx - (hw + 8 + lw) / 2;
-    text(ctx, hi, sx, y + h - P - 70, 72, "Inter Semi", INK);
-    text(ctx, lo, sx + hw + 8, y + h - P - 70, 40, "Inter Medium", LABEL3);
-    text(ctx, `${d.rain ?? 0}%`, cx, y + h - P, 36, "Inter Semi", INK, "center");
+    const hw = measure(ctx, hi, 60, "Inter Semi"), lw = measure(ctx, lo, 40, "Inter Medium"), sx = cx - (hw + 4 + lw) / 2;
+    text(ctx, hi, sx, y + h - P - 72, 60, "Inter Semi", INK);
+    text(ctx, lo, sx + hw + 4, y + h - P - 72, 40, "Inter Medium", LABEL3);
+    text(ctx, `${d.rain ?? 0}%`, cx, y + h - P, 40, "Inter Semi", d.rain >= 50 ? INK : LABEL3, "center");
+  });
+}
+
+// Next 12 hours: temperature line (labelled now, +4, +8, +12 h), rain chance as light bars along the bottom.
+function hourlyChart(ctx, x, y, w, h, hourly, now) {
+  const pts = (hourly || []).filter((p) => p.temp != null && p.at >= now - 60e3 && p.at <= now + 12.5 * 3600e3);
+  if (pts.length < 4) { text(ctx, "No hourly forecast", x + w / 2, y + h / 2 + 30, 40, "Inter Semi", LABEL3, "center"); return; }
+  const top = y + 80, bottom = y + h - 60, inset = 40;
+  const temps = pts.map((p) => p.temp), lo = Math.min(...temps), hi = Math.max(...temps);
+  const span = Math.max(hi - lo, 4), mid = (hi + lo) / 2; // flat days stay flat
+  const t0 = pts[0].at, t1 = pts[pts.length - 1].at;
+  const px = (t) => x + inset + ((w - 2 * inset) * (t - t0)) / (t1 - t0);
+  const py = (t) => bottom - 34 - ((bottom - 34 - top) * (t - (mid - span / 2))) / span;
+
+  // rain chance: bars up to a third of the chart, only when it's worth noticing
+  const barW = 20;
+  pts.forEach((p) => {
+    if (p.rain < 20) return;
+    const bh = ((bottom - top) / 3) * p.rain / 100;
+    rrect(ctx, px(p.at) - barW / 2, bottom - bh, barW, bh, barW / 2, "#b0b0b0");
+  });
+  ctx.fillStyle = SEP; ctx.fillRect(x, bottom, w, 2);
+  ctx.save(); ctx.lineWidth = 7; ctx.lineJoin = "round"; ctx.lineCap = "round"; ctx.strokeStyle = INK;
+  ctx.beginPath(); pts.forEach((p, i) => (i ? ctx.lineTo(px(p.at), py(p.temp)) : ctx.moveTo(px(p.at), py(p.temp)))); ctx.stroke();
+  ctx.restore();
+
+  // labels: now, then every 4 hours
+  pts.filter((p, i) => i === 0 || (i % 4 === 0 && p.at - t0 > 2 * 3600e3)).forEach((p, k) => {
+    const cx = px(p.at), cy = py(p.temp);
+    ctx.fillStyle = INK; ctx.beginPath(); ctx.arc(cx, cy, 11, 0, 2 * Math.PI); ctx.fill();
+    ctx.fillStyle = CARD; ctx.beginPath(); ctx.arc(cx, cy, 4, 0, 2 * Math.PI); ctx.fill();
+    // card-coloured halo so the number stays readable where the line runs through it
+    const label = `${Math.round(p.temp)}°`;
+    setFont(ctx, 50, "Inter Semi"); ctx.textAlign = "center"; ctx.lineJoin = "round"; ctx.lineWidth = 14; ctx.strokeStyle = CARD;
+    ctx.strokeText(label, cx, cy - 28); ctx.letterSpacing = "0px";
+    text(ctx, label, cx, cy - 28, 50, "Inter Semi", INK, "center");
+    text(ctx, k === 0 ? "Now" : hhmm(p.at), cx, bottom + 48, 36, k === 0 ? "Inter Bold" : "Inter Medium", k === 0 ? INK : LABEL3, "center");
   });
 }
 
 // One Usage card: spend by period on top, activity heatmap + this week's bars below.
 function usageWidget(ctx, x, y, w, h, usage) { // periods stacked on the left, heatmap on the right
   widget(ctx, x, y, w, h);
-  if (!usage) { header(ctx, x, y, w, "Usage", glyphs.dollar); text(ctx, "TokeX data unavailable", x + w / 2, y + h / 2, 38, "Inter Semi", LABEL3, "center"); return; }
+  if (!usage) { header(ctx, x, y, w, "Usage", glyphs.bars); text(ctx, "TokeX data unavailable", x + w / 2, y + h / 2, 38, "Inter Semi", LABEL3, "center"); return; }
 
   const byDate = new Map(usage.history.map((d) => [d.date, d.tokens]));
   const end = new Date(usage.today + "T12:00:00");
   let streak = 0;
   for (let d = new Date(end); byDate.get(d.toLocaleDateString("en-CA")) > 0; d.setDate(d.getDate() - 1)) streak++;
-  header(ctx, x, y, w, "Usage", glyphs.dollar, `${streak}-day streak`);
+  header(ctx, x, y, w, "Usage", glyphs.bars, `${streak}-day streak`);
 
   const rows = [
     ["Today", usage.cost, usage.tokens, fmtCost],
@@ -693,7 +748,7 @@ function render({ agents = [], usage = null, weather = null, todos = null, limit
   agentsWidget(ctx, M + limW + GAP, y, full - limW - GAP, rowH, agents, now);
 
   if (standalone) rrect(ctx, M, weatherY, full, weatherH, R, KINDLE_CARD); // the Kindle fills it in
-  else weatherCard(ctx, M, weatherY, full, weatherH, weather);
+  else weatherCard(ctx, M, weatherY, full, weatherH, weather, now);
 
   return grayPng(ctx.getImageData(0, 0, W, H).data, W, H);
 }

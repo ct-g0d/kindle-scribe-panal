@@ -1,14 +1,10 @@
-// Token usage (from TokeX's local DB, read-only) and weather (Open-Meteo, no API key).
+// Token usage (from TokeX's local DB, read-only), usage limits and now playing. Weather is in weather.js.
 const { DatabaseSync } = require("node:sqlite");
 
 const TOKEX_DB = process.env.TOKEX_DB || "D:/TokeX/data/token-monitor.sqlite";
-const LAT = process.env.WEATHER_LAT || "-36.85"; // Auckland
-const LON = process.env.WEATHER_LON || "174.76";
-const TZ = process.env.WEATHER_TZ || "Pacific/Auckland";
-const WEATHER_TTL = 15 * 60e3;
 
 function localDate(d = new Date()) {
-  return new Intl.DateTimeFormat("en-CA", { timeZone: TZ }).format(d); // YYYY-MM-DD
+  return new Intl.DateTimeFormat("en-CA").format(d); // YYYY-MM-DD in the PC's own time zone
 }
 
 function readUsage() {
@@ -46,42 +42,12 @@ function readUsage() {
   }
 }
 
-// last good forecast is kept on disk too, so a restart during a network blip still shows weather
-const WEATHER_FILE = require("node:path").join(__dirname, "weather-cache.json");
-let weatherCache = (() => {
-  try { return { at: 0, data: JSON.parse(require("node:fs").readFileSync(WEATHER_FILE, "utf8")) }; } catch { return null; }
-})();
-async function readWeather() {
-  if (weatherCache && Date.now() - weatherCache.at < WEATHER_TTL) return weatherCache.data;
-  const url = `https://api.open-meteo.com/v1/forecast?latitude=${LAT}&longitude=${LON}` +
-    `&current=temperature_2m,apparent_temperature,weather_code,wind_speed_10m,relative_humidity_2m` +
-    `&minutely_15=precipitation&forecast_minutely_15=12&past_minutely_15=24` +
-    `&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max` +
-    `&timezone=${encodeURIComponent(TZ)}&forecast_days=5`;
-  try {
-    const r = await fetch(url, { signal: AbortSignal.timeout(10000) });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    const j = await r.json();
-    const data = {
-      now: {
-        temp: j.current.temperature_2m, feels: j.current.apparent_temperature, code: j.current.weather_code,
-        wind: j.current.wind_speed_10m, humidity: j.current.relative_humidity_2m,
-      },
-      // past 6 h + next 3 h in 15-min steps; local ISO times -> epoch ms
-      rain15: (j.minutely_15?.time || []).map((t, i) => ({
-        at: Date.parse(t + "Z") - j.utc_offset_seconds * 1000, mm: j.minutely_15.precipitation[i] ?? 0,
-      })),
-      days: j.daily.time.map((date, i) => ({
-        date, code: j.daily.weather_code[i], max: j.daily.temperature_2m_max[i],
-        min: j.daily.temperature_2m_min[i], rain: j.daily.precipitation_probability_max[i],
-      })),
-    };
-    weatherCache = { at: Date.now(), data };
-    try { require("node:fs").writeFileSync(WEATHER_FILE, JSON.stringify(data)); } catch { /* cache is optional */ }
-    return data;
-  } catch (e) {
-    return weatherCache?.data || null; // keep showing the last good forecast
-  }
+// Cache files can be shared by several accounts' loops: write a temp file and rename it in, so a reader
+// never sees half a file.
+function writeCache(file, data) {
+  const fs = require("node:fs"), tmp = `${file}.${process.pid}.tmp`;
+  try { fs.writeFileSync(tmp, JSON.stringify(data)); fs.renameSync(tmp, file); }
+  catch { try { fs.unlinkSync(tmp); } catch { /* cache is optional */ } }
 }
 
 // Usage limits (5h session / weekly windows) via TokeX's own limits module, using the logins TokeX already
@@ -89,8 +55,9 @@ async function readWeather() {
 // does, at most every LIMITS_TTL.
 const TOKEX_DIR = process.env.TOKEX_DIR || "D:/TokeX";
 const LIMITS_TTL = 5 * 60e3;
-// last good snapshot survives restarts (percentages and reset times only, no account details)
-const LIMITS_FILE = require("node:path").join(__dirname, "limits-cache.json");
+// last good snapshot survives restarts (percentages and reset times only, no account details).
+// Per Windows account: each has its own TokeX logins, and a stale provider from another account would stick.
+const LIMITS_FILE = require("node:path").join(__dirname, `limits-cache-${require("node:os").userInfo().username}.json`);
 let limitsCache = (() => {
   try { return { at: 0, data: JSON.parse(require("node:fs").readFileSync(LIMITS_FILE, "utf8")) }; } catch { return null; }
 })();
@@ -158,7 +125,7 @@ async function readLimits() {
     const order = ["claude", "codex", "antigravity"];
     data.sort((a, b) => (order.indexOf(a.provider) + 1 || 99) - (order.indexOf(b.provider) + 1 || 99));
     limitsCache = { at: Date.now(), data };
-    try { require("node:fs").writeFileSync(LIMITS_FILE, JSON.stringify(data)); } catch { /* cache is optional */ }
+    writeCache(LIMITS_FILE, data);
     return data;
   } catch (e) {
     return limitsCache?.data || null; // keep the last good snapshot
@@ -176,9 +143,8 @@ function readNowPlaying() {
   });
 }
 
-module.exports = { readUsage, readWeather, readLimits, readNowPlaying, TZ, LAT, LON };
+module.exports = { readUsage, readLimits, readNowPlaying, writeCache };
 
 if (require.main === module) {
   console.dir(readUsage(), { depth: 3 });
-  readWeather().then((w) => console.dir(w, { depth: 3 }));
 }

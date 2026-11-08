@@ -1,8 +1,10 @@
 node_modules/
-# runtime state
-panel.log
-panel.pid
+# runtime state (logs, pids and the limits cache are per Windows account: panel-<username>.log etc.)
+panel*.log
+panel*.log.tmp
+panel*.pid
 preview.png
 preview-offline.png
-limits-cache.json
+limits-cache*.json
 weather-cache.json
+*.tmp
