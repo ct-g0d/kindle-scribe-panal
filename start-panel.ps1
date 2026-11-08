@@ -1,8 +1,8 @@
-# Started by the "Kindle Agents Panel" scheduled task at login.
+# Started by the "Kindle Agents Panel" scheduled task at login (every account; see install-task.ps1).
 # Keeps the panel loop alive: if node exits for any reason, wait 30s and start it again.
-# Output goes to panel.log next to this script (trimmed when it passes 2 MB).
+# Output goes to panel-<username>.log next to this script (trimmed when it passes 2 MB).
 Set-Location $PSScriptRoot
-$log = Join-Path $PSScriptRoot "panel.log"
+$log = Join-Path $PSScriptRoot "panel-$env:USERNAME.log"
 $node = (Get-Command node -ErrorAction Stop).Source
 
 while ($true) {

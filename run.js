@@ -5,10 +5,12 @@
 const fs = require("node:fs");
 const path = require("node:path");
 
-const { spawn } = require("node:child_process");
+const os = require("node:os");
+const { spawn, execFile } = require("node:child_process");
 const { readAgents } = require("./agents");
 const { render, renderIcons, kindleLayout, ready } = require("./panel");
-const { readUsage, readWeather, readLimits, readNowPlaying, LAT, LON, TZ } = require("./extras");
+const { readUsage, readLimits, readNowPlaying } = require("./extras");
+const { readWeather } = require("./weather");
 const { readTodos } = require("./warplan");
 
 const HOST = process.env.KINDLE_HOST || "192.168.68.58";
@@ -31,6 +33,15 @@ const parseBattery = (out) => {
 const sshArgs = (cmd) => ["-p", PORT, "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=8",
   "-o", "NumberOfPasswordPrompts=1", `root@${HOST}`, cmd];
 const sshEnv = { ...process.env, SSH_ASKPASS: ASKPASS, SSH_ASKPASS_REQUIRE: "force", DISPLAY: "x" };
+
+// Each signed-in Windows account runs its own copy; only the session on screen pushes (session-active.ps1 prints 1/0).
+const SESSION_PS = path.join(__dirname, "session-active.ps1");
+function sessionActive() {
+  return new Promise((resolve) => {
+    execFile("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", SESSION_PS],
+      { timeout: 8000, windowsHide: true, encoding: "utf8" }, (err, out) => resolve((out || "").trim() !== "0"));
+  });
+}
 
 // battery only (used once at startup so the first frame already has it)
 function readBattery() {
@@ -72,6 +83,11 @@ const PLUGIN = "/mnt/us/koreader/plugins/kindlepanel.koplugin";
 const toLua = (v) => typeof v === "object"
   ? `{ ${Object.entries(v).map(([k, x]) => `${k} = ${toLua(x)}`).join(", ")} }`
   : typeof v === "string" ? JSON.stringify(v) : String(v);
+// layout.lua also tells the Kindle where it is (for its own Open-Meteo weather); rewritten when the PC moves
+let place = { name: "Auckland", lat: -36.85, lon: 174.76 }, layoutKey = null;
+const placeKey = (p) => `${p.name}|${p.lat}|${p.lon}`;
+const layoutLua = () => Buffer.from(`-- written by run.js on the PC\nreturn ${toLua({
+  ...kindleLayout(), city: place.name, lat: String(place.lat), lon: String(place.lon), tz: "auto" })}\n`);
 async function installApp() {
   if ((await remote(`mkdir -p ${APP}/fonts ${PLUGIN} /mnt/us/documents && ls ${APP}/fonts`)) == null)
     return console.log("app install skipped (Kindle unreachable), will retry on restart");
@@ -83,11 +99,12 @@ async function installApp() {
     ...fs.readdirSync(path.join(kdir, "fonts")).filter((f) => !have.has(f))
       .map((f) => [fs.readFileSync(path.join(kdir, "fonts", f)), `${APP}/fonts/${f}`]),
     ...renderIcons().map(({ kind, png }) => [png, `${APP}/wx-${kind}.png`]),
-    [Buffer.from(`-- written by run.js on the PC\nreturn ${toLua({ ...kindleLayout(), lat: LAT, lon: LON, tz: TZ })}\n`), `${APP}/layout.lua`],
+    [layoutLua(), `${APP}/layout.lua`],
     [Buffer.from("Tap to open the Kindle Panel. Long-press or swipe the panel to close it.\n"), "/mnt/us/documents/Kindle Panel.kpanel"],
   ];
   let ok = true;
   for (const [buf, dest] of files) ok = (await upload(buf, `'${dest}'`)) && ok;
+  if (ok) layoutKey = placeKey(place);
   // the old shell watchdog is replaced by the app
   await remote("pkill -f '[p]anel-watchdog'; rm -f /mnt/us/panel-watchdog.sh /mnt/us/panel-offline.png; true");
   console.log(ok ? "Kindle app installed (restart KOReader once to load a new version)" : "Kindle app install incomplete, will retry on restart");
@@ -141,8 +158,24 @@ async function gather() {
 // The frame the Kindle falls back to when the PC goes away; refreshed every BASE_EVERY pushes.
 const BASE_EVERY = 5;
 let lastPushAt = 0;
+let active = null; // last session state, so the log only notes changes
+let installed = false;
 async function tick() {
+  const inUse = await sessionActive();
+  if (inUse !== active) {
+    console.log(`${new Date().toLocaleTimeString()}  ${inUse ? "this session is in use: pushing" : "another session is in use: paused"}`);
+    if (inUse) lastPushAt = 0; // coming back: someone else drew meanwhile, so flash a full refresh
+    active = inUse;
+  }
+  if (!active) return;
+  // only the session in use touches the Kindle, so two accounts never install at once
+  if (!installed) { installed = true; await installApp(); await readBattery(); }
   const data = await gather();
+  if (data.weather?.place?.name) place = data.weather.place;
+  if (layoutKey !== placeKey(place) && await upload(layoutLua(), `${APP}/layout.lua`)) {
+    layoutKey = placeKey(place);
+    console.log(`Kindle weather location: ${place.name} (${place.lat}, ${place.lon})`);
+  }
   const png = render(data);
   // full refresh on the usual cycle, and when coming back after a gap (the Kindle drew its own screen meanwhile)
   const full = pushes % FULL_EVERY === 0 || Date.now() - lastPushAt > 5 * 60e3;
@@ -165,10 +198,9 @@ async function main() {
     fs.writeFileSync(path.join(__dirname, "preview-offline.png"), render(data, { standalone: true }));
     return console.log("wrote preview.png, preview-offline.png");
   }
-  fs.writeFileSync(path.join(__dirname, "panel.pid"), String(process.pid)); // lets stop-panel.ps1 find this loop
+  // one per account, since every signed-in account runs its own loop from this folder (stop-panel.ps1 reads it)
+  fs.writeFileSync(path.join(__dirname, `panel-${os.userInfo().username}.pid`), String(process.pid));
   await ready;
-  await installApp();
-  await readBattery();
   if (args.includes("--once")) return tick();
 
   console.log(`Agents panel -> ${HOST}:${PORT} every ${INTERVAL / 1000}s (Ctrl+C to stop)`);
